@@ -1,0 +1,10 @@
+apiVersion: apps.example.com/v1
+kind: MiniReplica
+metadata:
+  labels:
+    app.kubernetes.io/name: mini-replicaset-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: minireplica-sample
+spec:
+  replicas: 2
+
