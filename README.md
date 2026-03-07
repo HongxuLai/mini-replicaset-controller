@@ -33,7 +33,8 @@ kind: MiniReplica
 metadata:
   name: demo
 spec:
-  replicas: 4
+  replicas: 4 
+```
 
 ## Reconciliation logic
 
