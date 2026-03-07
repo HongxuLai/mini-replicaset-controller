@@ -149,3 +149,15 @@ we can see after deleting, the pod's name is different
 "nginx: latest" to "nginx:latest" 
 Moreover, I always found the terminal did not show the output I expected, and misunderstood that the terminal was broken, so I added log to record every step of the model 
 4. The scaling operation was successful but the status wasn't updated immediately. This taught me that reconciliation is not always reflected immediately in status, and that the controller may need another reconciliation cycle to observe and correct the updated state.
+
+## Demo Screenshots
+
+### Scale up
+After increasing `spec.replicas`, the controller created additional Pods.
+
+![Scale up demo](images/scale-up.png)
+
+### Pod recreation
+After deleting a managed Pod, the controller created a new Pod to restore the desired state.
+
+![Pod recreation demo](images/pod-recreation.png)
