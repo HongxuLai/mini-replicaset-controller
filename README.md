@@ -23,6 +23,8 @@ The controller currently supports:
 
 This is a simplified educational controller and does not implement all behaviors of the built-in Kubernetes ReplicaSet.
 
+This project was bootstrapped with Kubebuilder and extended with a simplified `MiniReplica` controller implementation.
+
 ## Custom Resource Example
 
 Example `MiniReplica` resource:
