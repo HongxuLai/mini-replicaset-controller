@@ -65,7 +65,7 @@ func (r *MiniReplicaReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// use labels to judge if this Pod belongs to the object
-	labels := map[string]string{
+	matchlabels := map[string]string{
 		"minireplica": instance.Name,
 	} // create key-value map
 
@@ -73,13 +73,59 @@ func (r *MiniReplicaReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.List( // similar to Get, get a list of elements
 		ctx,
 		podList,
-		client.InNamespace(req.Namespace), // retrict the range
-		client.MatchingLabels(labels),     // use this label to select
+		client.InNamespace(req.Namespace), // retrict the range   
 	); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	actualCount := len(podList.Items)
+	var ownedPods []*corev1.Pod
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+
+		// check label match
+		if pod.Labels["minireplica"] != instance.Name{
+			continue
+		}
+
+		// check the pod's current controller
+		owner := metav1.GetControllerOf(pod)
+
+		// case1: an orphan pod
+		if owner == nil { 
+			log.Info("adopting orphan pod", "podName", pod.Name)
+
+			// change the pod's ownerRef to current MiniReplica
+			if err := controllerutil.SetControllerReference(instance, pod, r.Scheme); err != nil{
+				return ctrl.Result{}, err
+			}
+
+			// update this changed Pod to API server
+			if err := r.Update(ctx, pod); err != nil {
+				log.Error(err, "failed to adopt orphan pod", "podName", pod.Name)
+				return ctrl.Result{}, err
+			}
+
+			ownedPods = append(ownedPods, pod)
+			continue
+		}
+
+		// case2: this pod already owned by the MiniReplica object
+		if owner.Kind == "MiniReplica" && owner.Name == instance.Name && owner.UID == instance.UID {
+			ownedPods = append(ownedPods, pod)
+			continue
+		}
+	
+		// record the pod owned by another controller
+		log.Info("skip pod owned by another controller",
+			"podName", pod.Name,
+			"ownerKind", owner.Kind,
+			"ownerName", owner.Name,
+		)
+
+		continue
+	}
+
+	actualCount := len(ownedPods)
 	desiredCount := int(instance.Spec.Replicas)
 	diff := desiredCount - actualCount // calculate the difference between desired and actual
 	/* used to debugging
@@ -105,7 +151,7 @@ func (r *MiniReplicaReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				ObjectMeta: metav1.ObjectMeta{
 					GenerateName: instance.Name + "-pod-",
 					Namespace:    req.Namespace,
-					Labels:       labels,
+					Labels:       matchlabels,
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
