@@ -161,3 +161,34 @@ After increasing `spec.replicas`, the controller created additional Pods.
 After deleting a managed Pod, the controller created a new Pod to restore the desired state.
 
 ![Pod recreation demo](images/pod-recreation.png)
+
+
+## Pod Adoption Logic (Updated by Mar, 15th)
+
+To make the MiniReplica controller closer to the behavior of the official Kubernetes ReplicaSet controller, orphan Pod adoption is added to the reconcile process.
+
+The whole process works as follows:
+
+1. The controller begins a new **Reconcile** loop.
+2. It retrieves the current **MiniReplica** object, which provides the key information needed for reconciliation, including:
+   - `Name`
+   - `Namespace`
+   - `UID`
+   - `Selector`
+   - desired replica count
+3. The controller uses the MiniReplica's **selector** to compare against Pod labels.
+4. If a Pod matches the selector, it becomes a **candidate Pod**. At this stage, the controller only knows that the Pod may be related to the MiniReplica, but its ownership is not yet confirmed.
+5. The controller then checks the Pod's **owner reference** to determine its actual ownership:
+   - If the Pod is already owned by the current MiniReplica, no adoption is needed.
+   - If the Pod has no controller owner, it is considered an **orphan Pod** and can be adopted.
+   - If the Pod is already owned by another controller, it cannot be adopted and is ignored.
+6. Only Pods that both:
+   - match the selector, and
+   - have no controller owner  
+   are eligible for adoption.
+7. Before performing adoption, the controller should re-check that the MiniReplica still exists and has not been deleted or replaced.
+8. Adoption is performed by setting the Pod's ownership to the current MiniReplica, turning the orphan Pod into an **owned Pod**.
+9. After all candidate Pods are checked, the controller uses the number of **owned Pods** to compare against the desired replica count.
+10. Based on this comparison, the controller can then decide whether it still needs to create or delete Pods.
+
+In short, orphan Pod adoption ensures that existing matching Pods are properly claimed before replica scaling decisions are made.
