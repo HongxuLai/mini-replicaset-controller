@@ -55,103 +55,166 @@ func (r *MiniReplicaReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// code under is used to debugging
 	// log.Info("reconcile triggered", "name", req.Name, "namespace", req.Namespace)
 	// get the object and judge if that's can be found
-	instance := &appsv1.MiniReplica{} // variable to record this mmoment
+
+	// 1. get MiniReplica
+	instance := &appsv1.MiniReplica{} // create a empty variable to record this mmoment
 	// use Get() to get exactly a MiniReplica object
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
+		// instance will get real content of Minireplica, like Name, Namespace, UID...
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
 	}
 
-	// use labels to judge if this Pod belongs to the object
-	matchlabels := map[string]string{
-		"minireplica": instance.Name,
-	} // create key-value map
+	// 2. list candidate pods.
+	pods, err := r.listCandidatePods(ctx, req.Namespace)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
+	// 3. filter owned pods
+	ownedPods, err := r.claimPods(ctx, instance, pods)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// finish the judgement of which pod belongs to now MiniReplica
+	// begin to manage replicas
+
+	// 4. compare desired and actual, then create / delete
+	if err := r.reconcileReplicas(ctx, req.Namespace, instance, ownedPods); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 5. update status 	
+	instance.Status.Running = int32(len(ownedPods)) // cast: Running's type is int32
+	if err := r.Status().Update(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	log.Info("reconcile finished",
+		"miniReplica", instance.Name,
+		"desired", instance.Spec.Replicas,
+		"actual", len(ownedPods),
+	)
+
+	return ctrl.Result{}, nil
+}
+
+// a helper used to list all candidate pods
+func (r *MiniReplicaReconciler) listCandidatePods(ctx context.Context, namespace string) ([]corev1.Pod, error) {
+	// go through every pod, use controller's selector to match pod's labels
 	podList := &corev1.PodList{}
 	if err := r.List( // similar to Get, get a list of elements
 		ctx,
 		podList,
-		client.InNamespace(req.Namespace), // retrict the range   
+		client.InNamespace(namespace),
+		// list the pod with in this namespace
 	); err != nil {
-		return ctrl.Result{}, err
+		return nil, err
 	}
+	return podList.Items, nil
+}
+
+// a helper used to filter pods
+func (r *MiniReplicaReconciler) claimPods(
+	ctx context.Context,
+	instance *appsv1.MiniReplica,
+	pods []corev1.Pod,
+) ([]*corev1.Pod, error) {
+	log := logf.FromContext(ctx)
 
 	var ownedPods []*corev1.Pod
-	for i := range podList.Items {
-		pod := &podList.Items[i]
 
-		// check label match
-		if pod.Labels["minireplica"] != instance.Name{
-			continue
-		}
-
-		// check the pod's current controller
+	for i := range pods {
+		pod := &pods[i]
 		owner := metav1.GetControllerOf(pod)
 
-		// case1: an orphan pod
-		if owner == nil { 
+		// create a simple selector
+		match := pod.Labels["minireplica"] == instance.Name
+
+		// case1: an orphan pod, begin to adopt
+		if owner == nil {
+			if !match {
+				continue
+			}
 			log.Info("adopting orphan pod", "podName", pod.Name)
 
-			// change the pod's ownerRef to current MiniReplica
-			if err := controllerutil.SetControllerReference(instance, pod, r.Scheme); err != nil{
-				return ctrl.Result{}, err
+			// set the pod's ownerRef to current MiniReplica, metadata is changed
+			if err := controllerutil.SetControllerReference(instance, pod, r.Scheme); err != nil {
+				return nil, err
 			}
 
 			// update this changed Pod to API server
 			if err := r.Update(ctx, pod); err != nil {
 				log.Error(err, "failed to adopt orphan pod", "podName", pod.Name)
-				return ctrl.Result{}, err
+				return nil, err
 			}
 
+			// add this pod to ownedPods
 			ownedPods = append(ownedPods, pod)
 			continue
 		}
 
-		// case2: this pod already owned by the MiniReplica object
+		// case 2: pod is already owned by current MiniReplica
+		// ownerRef is matched
 		if owner.Kind == "MiniReplica" && owner.Name == instance.Name && owner.UID == instance.UID {
-			ownedPods = append(ownedPods, pod)
+			if match {
+				// still matches selector, keep as owned
+				ownedPods = append(ownedPods, pod)
+			} else {
+				// ownerRef is mached, but the labels are not matched
+				// logical release: this pod won't be seen as the MiniReplica's pod
+				log.Info("logical release pod because selector no longer matches",
+					"podName", pod.Name,
+					"ownerName", owner.Name,
+				)
+			}
 			continue
 		}
-	
-		// record the pod owned by another controller
+
+		// case3: record the pod owned by another controller
 		log.Info("skip pod owned by another controller",
 			"podName", pod.Name,
 			"ownerKind", owner.Kind,
 			"ownerName", owner.Name,
 		)
-
-		continue
 	}
+	return ownedPods, nil
+}
 
+// a helper used to compare actual and desired, and exactly begin to delete / create pods
+func (r *MiniReplicaReconciler) reconcileReplicas(
+	ctx context.Context,
+	namespace string,
+	instance *appsv1.MiniReplica,
+	ownedPods []*corev1.Pod,
+) error {
+	log := logf.FromContext(ctx)
+
+	// calculate actual and desired pod
 	actualCount := len(ownedPods)
 	desiredCount := int(instance.Spec.Replicas)
-	diff := desiredCount - actualCount // calculate the difference between desired and actual
-	/* used to debugging
-	log.Info("reconcile state",
-	"desired", desiredCount,
-	"actual", actualCount,
-	"diff", diff,
-	)
-	for _, p := range podList.Items {
-	log.Info("matched pod",
-		"podName", p.Name,
-		"phase", p.Status.Phase,
-		"namespace", p.Namespace,
-	)
+	// calculate difference
+	diff := desiredCount - actualCount
+
+	// create a selector
+	matchLabels := map[string]string{
+		"minireplica": instance.Name,
 	}
-	*/
-	
+
 	if diff > 0 {
 		log.Info("enter create branch", "count", diff)
+
+		// first construct a pod's information 
+		// including including ObjectMeta(who is the Pod) and Spec(what can the Pod do)
 		for i := 0; i < diff; i++ {
-			// construct the pod, including ObjectMeta(who is the Pod) and Spec(what can the Pod do)
 			pod := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					GenerateName: instance.Name + "-pod-",
-					Namespace:    req.Namespace,
-					Labels:       matchlabels,
+					Namespace:    namespace,
+					Labels:       matchLabels,
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
@@ -162,31 +225,38 @@ func (r *MiniReplicaReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					},
 				},
 			}
+
+			// set the pod's ownerRef to now MiniReplica object before creating
 			if err := controllerutil.SetControllerReference(instance, pod, r.Scheme); err != nil {
-				return ctrl.Result{}, err
+				return err
 			}
+
 			log.Info("creating pod", "generateName", pod.GenerateName)
+
+			// really create a new pod
 			if err := r.Create(ctx, pod); err != nil {
 				log.Error(err, "failed to create pod", "generateName", pod.GenerateName)
-				return ctrl.Result{}, err
+				return err
 			}
 		}
 	} else if diff < 0 {
 		toDelete := -diff
+		log.Info("enter delete branch", "count", toDelete)
+
+		// delete some first owned pods
 		for i := 0; i < toDelete; i++ {
-			pod := &podList.Items[i]
+			pod := ownedPods[i]
+			log.Info("deleting pod", "podName", pod.Name)
+
 			if err := r.Delete(ctx, pod); err != nil {
-				return ctrl.Result{}, err
+				return err
 			}
 		}
 	}
 
-	instance.Status.Running = int32(actualCount) // cast: Running's type is int32
-	if err := r.Status().Update(ctx, instance); err != nil {
-		return ctrl.Result{}, err
-	}
-	return ctrl.Result{}, nil
+	return nil
 }
+
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *MiniReplicaReconciler) SetupWithManager(mgr ctrl.Manager) error {

@@ -2,24 +2,31 @@
 
 ## Project Overview
 
+## Project Overview
+
 This project implements a simplified ReplicaSet-like controller using Go and controller-runtime.
 
 The controller watches custom `MiniReplica` resources and reconciles the number of Pods in the cluster to match the desired replica count specified in the resource.
 
 This project was built as a learning exercise to understand:
+
 - Kubernetes controllers and the reconcile loop
 - desired state vs. actual state
 - label-based Pod selection
 - owner references
-- basic Pod creation and deletion logic
+- pod adoption and logic release
+- basic pod creation and deletion logic
 
 The controller currently supports:
 
 - Watching `MiniReplica` custom resources
-- Listing Pods that belong to a `MiniReplica` using labels
-- Creating Pods when the actual count is smaller than the desired count
-- Deleting extra Pods when the actual count is larger than the desired count
-- Setting owner references on created Pods
+- Listing candidate Pods in the namespace
+- Claiming Pods through ownership checks
+- Adopting matching orphan Pods
+- Releasing previously owned Pods when they no longer match the selector
+- Scaling up by creating new Pods
+- Scaling down by deleting extra Pods
+- Updating MiniReplica status based on currently owned Pods
 
 This is a simplified educational controller and does not implement all behaviors of the built-in Kubernetes ReplicaSet.
 
@@ -192,3 +199,70 @@ The whole process works as follows:
 10. Based on this comparison, the controller can then decide whether it still needs to create or delete Pods.
 
 In short, orphan Pod adoption ensures that existing matching Pods are properly claimed before replica scaling decisions are made.
+
+## Reconcile Flow (Updated by Mar, 22nd)
+
+The controller's reconcile logic is structured into the following stages:
+
+1. **Get MiniReplica**
+   - Load the current `MiniReplica` resource from the API server.
+
+2. **List candidate Pods**
+   - List Pods in the same namespace as potential candidates related to this controller.
+
+3. **Claim / filter owned Pods**
+   - Check Pod labels and owner references.
+   - Adopt matching orphan Pods.
+   - Keep Pods already owned by this `MiniReplica` if they still match the selector.
+   - Logically release Pods that are still owned by this `MiniReplica` but no longer match the selector.
+
+4. **Compare desired vs. actual**
+   - Compare `spec.replicas` with the number of currently claimed Pods.
+
+5. **Create / delete Pods**
+   - Create missing Pods if actual replicas are below desired replicas.
+   - Delete extra Pods if actual replicas are above desired replicas.
+
+6. **Update status**
+   - Update `MiniReplica.status.running` using the current owned Pod count.
+
+## Adoption and Release Semantics
+
+The controller uses a simplified ownership model inspired by the Kubernetes ReplicaSet controller.
+
+For each candidate Pod, the controller checks both:
+
+- whether the Pod matches the `MiniReplica` selector
+- whether the Pod is already controlled by this `MiniReplica`
+
+The behavior is:
+
+- **Orphan Pod + selector matches**
+  - The controller adopts the Pod by setting its controller owner reference to the current `MiniReplica`.
+
+- **Owned by current MiniReplica + selector still matches**
+  - The Pod is kept as an owned Pod and counted toward the replica total.
+
+- **Owned by current MiniReplica + selector no longer matches**
+  - The Pod is logically released.
+  - It is no longer counted as an owned Pod during reconcile.
+  - In the current version, this release is implemented at the reconcile semantics level rather than by patching and removing the owner reference from the Pod object.
+
+- **Owned by another controller**
+  - The Pod is ignored and not claimed.
+
+## Code Structure
+
+To make the controller logic clearer and closer to the structure of the official controller pattern, the reconcile workflow was refactored into helper functions:
+
+- `listCandidatePods(...)`
+  - Lists Pods in the namespace as candidate objects.
+
+- `claimPods(...)`
+  - Handles Pod ownership decisions, including:
+    - adoption of matching orphan Pods
+    - retaining matching owned Pods
+    - logical release of owned Pods that no longer match the selector
+
+- `reconcileReplicas(...)`
+  - Compares desired and actual replica counts and performs Pod creation or deletion.
