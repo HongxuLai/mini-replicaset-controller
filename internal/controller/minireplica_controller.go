@@ -50,6 +50,7 @@ type MiniReplicaReconciler struct {
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.1/pkg/reconcile
+
 func (r *MiniReplicaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	// code under is used to debugging
@@ -79,16 +80,34 @@ func (r *MiniReplicaReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
+	// filter Failed and Succeeded pods from ownedPods 
+	activePods := filterActivePods(ownedPods)
+
 	// finish the judgement of which pod belongs to now MiniReplica
 	// begin to manage replicas
 
 	// 4. compare desired and actual, then create / delete
-	if err := r.reconcileReplicas(ctx, req.Namespace, instance, ownedPods); err != nil {
+	if err := r.reconcileReplicas(ctx, req.Namespace, instance, activePods); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// 5. update status 	
-	instance.Status.Running = int32(len(ownedPods)) // cast: Running's type is int32
+	latestPods, err := r.listCandidatePods(ctx, req.Namespace)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	latestOwnedPods, err := r.claimPods(ctx, instance, latestPods)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	replicas, readyReplicas := calculateReplicaStatus(latestOwnedPods)
+
+	// 6. update status
+	instance.Status.Replicas = replicas
+	instance.Status.ReadyReplicas = readyReplicas
+
 	if err := r.Status().Update(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -96,7 +115,7 @@ func (r *MiniReplicaReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	log.Info("reconcile finished",
 		"miniReplica", instance.Name,
 		"desired", instance.Spec.Replicas,
-		"actual", len(ownedPods),
+		"actual", len(activePods),
 	)
 
 	return ctrl.Result{}, nil
@@ -161,15 +180,20 @@ func (r *MiniReplicaReconciler) claimPods(
 		// ownerRef is matched
 		if owner.Kind == "MiniReplica" && owner.Name == instance.Name && owner.UID == instance.UID {
 			if match {
-				// still matches selector, keep as owned
+				// case2A: still matches selector, keep as owned
 				ownedPods = append(ownedPods, pod)
 			} else {
+				// case2B
 				// ownerRef is mached, but the labels are not matched
 				// logical release: this pod won't be seen as the MiniReplica's pod
-				log.Info("logical release pod because selector no longer matches",
+				log.Info("physically release pod because selector no longer matches",
 					"podName", pod.Name,
 					"ownerName", owner.Name,
 				)
+				if err := r.releasePod(ctx, instance, pod); err != nil {
+					log.Error(err, "Failed to release pod", "podName", pod.Name)
+					return nil, err
+				}
 			}
 			continue
 		}
@@ -184,6 +208,93 @@ func (r *MiniReplicaReconciler) claimPods(
 	return ownedPods, nil
 }
 
+// a helper used to release pod physically
+func (r *MiniReplicaReconciler) releasePod(
+	ctx context.Context,
+	instance *appsv1.MiniReplica,
+	pod *corev1.Pod,
+) error {
+	var newOwnerRefs []metav1.OwnerReference
+	removed := false
+
+	for _, ownerRef := range pod.OwnerReferences {
+		if ownerRef.Kind == "MiniReplica" &&
+		ownerRef.Name == instance.Name &&
+		ownerRef.UID == instance.UID {
+			removed = true
+			continue
+		}
+		newOwnerRefs = append(newOwnerRefs, ownerRef)
+	}
+
+	if !removed {
+		return nil
+	}
+
+	pod.OwnerReferences = newOwnerRefs
+	return r.Update(ctx, pod)
+}
+
+func isPodReady(pod *corev1.Pod) bool {
+	// judge if this pod is being deleted
+	if pod.DeletionTimestamp != nil{
+		return false
+	}
+
+	// judge if this pod is running now
+	if pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+
+	// go through every condition is pod.Status.Conditions
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+
+	return false
+}
+
+// calculate valid pods number, and ready pods number
+func calculateReplicaStatus(ownedPods []*corev1.Pod) (int32, int32) {
+	var replicas int32
+	var readyReplicas int32
+
+	for _, pod := range ownedPods {
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+
+		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
+			continue
+		}
+
+		replicas ++
+		if isPodReady(pod) {
+			readyReplicas ++
+		}
+	}
+
+	return replicas, readyReplicas
+}
+
+func filterActivePods(ownedPods []*corev1.Pod) []*corev1.Pod {
+	var activePods []*corev1.Pod
+	for _, pod := range ownedPods {
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+
+		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
+			continue
+		}
+
+		activePods = append(activePods, pod)
+	}
+	return activePods
+}
+
 // a helper used to compare actual and desired, and exactly begin to delete / create pods
 func (r *MiniReplicaReconciler) reconcileReplicas(
 	ctx context.Context,
@@ -192,7 +303,6 @@ func (r *MiniReplicaReconciler) reconcileReplicas(
 	ownedPods []*corev1.Pod,
 ) error {
 	log := logf.FromContext(ctx)
-
 	// calculate actual and desired pod
 	actualCount := len(ownedPods)
 	desiredCount := int(instance.Spec.Replicas)

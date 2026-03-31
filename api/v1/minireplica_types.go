@@ -53,7 +53,8 @@ type MiniReplicaStatus struct {
 	//
 	// The status of each condition is one of True, False, or Unknown.
 
-	Running int32 `json:"running,omitempty"`
+	Replicas int32 `json:"replicas,omitempty"`
+	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
 }
 
 // +kubebuilder:object:root=true
